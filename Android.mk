@@ -30,6 +30,12 @@ common_CFLAGS := \
 	-DHAVE_VISIBILITY=1 \
 	-DHAVE_LIBDRM_ATOMIC_PRIMITIVES=1
 
+ifeq ($(ENABLE_HYP),true)
+common_CFLAGS += \
+	-DDRM_FE \
+	-DLIBDIR='"/vendor/lib64"'
+endif
+
 # Static library for the device (recovery)
 include $(CLEAR_VARS)
 
