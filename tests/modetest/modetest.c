@@ -223,6 +223,7 @@ static void dump_blob(struct device *dev, uint32_t blob_id)
 	uint32_t i;
 	unsigned char *blob_data;
 	drmModePropertyBlobPtr blob;
+	uint32_t printable = 0;
 
 	blob = drmModeGetPropertyBlob(dev->fd, blob_id);
 	if (!blob) {
@@ -236,8 +237,19 @@ static void dump_blob(struct device *dev, uint32_t blob_id)
 		if (i % 16 == 0)
 			printf("\n\t\t\t");
 		printf("%.2hhx", blob_data[i]);
+
+		if (isascii(blob_data[i]))
+				printable++;
 	}
 	printf("\n");
+
+	if (printable == blob->length) {
+		printf("\n-------------------------------------------------\n");
+		for (i = 0; i < blob->length; i++) {
+			printf("%c", blob_data[i]);
+		}
+		printf("\n-------------------------------------------------\n");
+	}
 
 	drmModeFreePropertyBlob(blob);
 }
