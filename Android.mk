@@ -88,6 +88,12 @@ common_CFLAGS := \
 	-Wno-sign-compare \
 	-Wno-tautological-compare
 
+ifeq ($(ENABLE_HYP),true)
+common_CFLAGS += \
+	-DDRM_FE \
+	-DLIBDIR='"/vendor/lib64"'
+endif
+
 # Static library for the device (recovery)
 include $(CLEAR_VARS)
 
