@@ -39,6 +39,9 @@ struct drm_interface_fe {
 	int (*drmopen_fe)(int minor, int type);
 };
 
+#ifdef DRMFE_STATIC
+extern struct drm_interface_fe drm_interface_fe;
+#else
 void * load_drm_fe_module(const char *path, const char *entrypoint)
 {
 	void *module, *interface;
@@ -56,9 +59,13 @@ void * load_drm_fe_module(const char *path, const char *entrypoint)
 
 	return interface;
 }
+#endif
 
 struct drm_interface_fe * get_drm_fe(void)
 {
+#ifdef DRMFE_STATIC
+	return &drm_interface_fe;
+#else
 	static struct drm_interface_fe *drm_interface_fe = NULL;
 	static int drm_fe_init = 0;
 
@@ -71,6 +78,7 @@ struct drm_interface_fe * get_drm_fe(void)
 	}
 
 	return drm_interface_fe;
+#endif
 }
 
 /* overwrite the default ioctl function */

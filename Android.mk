@@ -134,5 +134,31 @@ LOCAL_CFLAGS := \
 include $(LIBDRM_COMMON_MK)
 include $(BUILD_SHARED_LIBRARY)
 
+# Static library for the device (recovery)
+include $(CLEAR_VARS)
+
+LOCAL_MODULE := libdrm_recovery
+LOCAL_VENDOR_MODULE := true
+
+LOCAL_SRC_FILES := $(filter-out %.h,$(LIBDRM_FILES))
+LOCAL_EXPORT_C_INCLUDE_DIRS := \
+	$(LOCAL_PATH) \
+	$(LOCAL_PATH)/include/drm
+
+LOCAL_C_INCLUDES := \
+	$(LOCAL_PATH)/include/drm
+
+common_CFLAGS += \
+	-DDRMFE_STATIC
+
+LOCAL_CFLAGS := \
+	$(common_CFLAGS)
+
+LOCAL_WHOLE_STATIC_LIBRARIES := \
+	lib_drm_fe
+
+include $(LIBDRM_COMMON_MK)
+include $(BUILD_STATIC_LIBRARY)
+
 include $(call all-makefiles-under,$(LOCAL_PATH))
 endif # if TARGET_USE_PRIVATE_LIBDRM is not true
