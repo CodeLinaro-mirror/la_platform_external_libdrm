@@ -64,6 +64,9 @@
 #include "buffers.h"
 #include "cursor.h"
 
+static enum util_fill_pattern primary_fill = UTIL_PATTERN_SMPTE;
+static enum util_fill_pattern secondary_fill = UTIL_PATTERN_TILES;
+
 struct crtc {
 	drmModeCrtc *crtc;
 	drmModeObjectProperties *props;
@@ -302,6 +305,8 @@ static const char *modifier_to_string(uint64_t modifier)
 		return "NVIDIA_16BX2_BLOCK(5)";
 	case DRM_FORMAT_MOD_BROADCOM_VC4_T_TILED:
 		return "MOD_BROADCOM_VC4_T_TILED";
+	case DRM_FORMAT_MOD_QCOM_COMPRESSED:
+		return "QCOM_COMPRESSED";
 	default:
 		return "(UNKNOWN MODIFIER)";
 	}
@@ -1011,9 +1016,10 @@ struct property_arg {
 	char name[DRM_PROP_NAME_LEN+1];
 	uint32_t prop_id;
 	uint64_t value;
+	bool optional;
 };
 
-static int set_property(struct device *dev, struct property_arg *p,
+static bool set_property(struct device *dev, struct property_arg *p,
 			drmModeAtomicReq *atomic_req)
 {
 	drmModeObjectProperties *props = NULL;
@@ -1046,13 +1052,13 @@ static int set_property(struct device *dev, struct property_arg *p,
 	if (p->obj_type == 0) {
 		fprintf(stderr, "Object %i not found, can't set property\n",
 			p->obj_id);
-		return -EINVAL;
+		return false;
 	}
 
 	if (!props) {
 		fprintf(stderr, "%s %i has no properties\n",
 			obj_type, p->obj_id);
-		return -EINVAL;
+		return false;
 	}
 
 	for (i = 0; i < (int)props->count_props; ++i) {
@@ -1063,9 +1069,10 @@ static int set_property(struct device *dev, struct property_arg *p,
 	}
 
 	if (i == (int)props->count_props) {
-		fprintf(stderr, "%s %i has no %s property\n",
-			obj_type, p->obj_id, p->name);
-		return -EINVAL;
+		if (!p->optional)
+			fprintf(stderr, "%s %i has no %s property\n",
+				obj_type, p->obj_id, p->name);
+		return false;
 	}
 
 	p->prop_id = props->props[i];
@@ -1081,7 +1088,7 @@ static int set_property(struct device *dev, struct property_arg *p,
 		fprintf(stderr, "failed to set %s %i property %s to %" PRIu64 ": %s\n",
 			obj_type, p->obj_id, p->name, p->value, strerror(errno));
 
-	return ret;
+	return true;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1372,6 +1379,55 @@ static void add_property(struct device *dev, uint32_t obj_id,
 	set_property(dev, &p, NULL);
 }
 
+static bool add_property_optional(struct device *dev, uint32_t obj_id,
+				  const char *name, uint64_t value)
+{
+	struct property_arg p;
+
+	p.obj_id = obj_id;
+	strcpy(p.name, name);
+	p.value = value;
+	p.optional = true;
+
+	return set_property(dev, &p, NULL);
+}
+
+static void set_gamma(struct device *dev, unsigned crtc_id, unsigned fourcc)
+{
+	unsigned blob_id = 0;
+	/* TODO: support 1024-sized LUTs, when the use-case arises */
+	struct drm_color_lut gamma_lut[256];
+	int i, ret;
+
+	if (fourcc == DRM_FORMAT_C8) {
+		/* TODO: Add C8 support for more patterns */
+		util_smpte_c8_gamma(256, gamma_lut);
+		drmModeCreatePropertyBlob(dev->fd, gamma_lut, sizeof(gamma_lut), &blob_id);
+	} else {
+		for (i = 0; i < 256; i++) {
+			gamma_lut[i].red =
+			gamma_lut[i].green =
+			gamma_lut[i].blue = i << 8;
+		}
+	}
+
+	add_property_optional(dev, crtc_id, "DEGAMMA_LUT", 0);
+	add_property_optional(dev, crtc_id, "CTM", 0);
+	if (!add_property_optional(dev, crtc_id, "GAMMA_LUT", blob_id)) {
+		uint16_t r[256], g[256], b[256];
+
+		for (i = 0; i < 256; i++) {
+			r[i] = gamma_lut[i].red;
+			g[i] = gamma_lut[i].green;
+			b[i] = gamma_lut[i].blue;
+		}
+
+		ret = drmModeCrtcSetGamma(dev->fd, crtc_id, 256, r, g, b);
+		if (ret)
+			fprintf(stderr, "failed to set gamma: %s\n", strerror(errno));
+	}
+}
+
 static int atomic_set_plane(struct device *dev, struct plane_arg *p,
 							int pattern, bool update)
 {
@@ -1481,7 +1537,7 @@ static int set_plane(struct device *dev, struct plane_arg *p,
 		p->w, p->h, p->format_str, plane_id);
 
 	plane_bo = bo_create(dev->fd, p->fourcc, p->w, p->h, handles,
-			     pitches, offsets, UTIL_PATTERN_TILES);
+			     pitches, offsets, secondary_fill);
 	if (plane_bo == NULL)
 		return -1;
 
@@ -1528,12 +1584,14 @@ static int set_plane(struct device *dev, struct plane_arg *p,
 static void atomic_set_planes(struct device *dev, struct plane_arg *p,
 			      unsigned int count, bool update)
 {
-	unsigned int i, pattern = UTIL_PATTERN_SMPTE;
+	unsigned int i, pattern = primary_fill;
 
 	/* set up planes */
 	for (i = 0; i < count; i++) {
 		if (i > 0)
-			pattern = UTIL_PATTERN_TILES;
+			pattern = secondary_fill;
+		else
+			set_gamma(dev, p[i].crtc_id, p[i].fourcc);
 
 		if (atomic_set_plane(dev, &p[i], pattern, update))
 			return;
@@ -1616,8 +1674,8 @@ static void atomic_set_mode(struct device *dev, struct pipe_arg *pipes, unsigned
 		if (pipe->mode == NULL)
 			continue;
 
-		printf("setting mode %s-%dHz@%s on connectors ",
-		       pipe->mode_str, pipe->mode->vrefresh, pipe->format_str);
+		printf("setting mode %s-%dHz on connectors ",
+		       pipe->mode_str, pipe->mode->vrefresh);
 		for (j = 0; j < pipe->num_cons; ++j) {
 			printf("%s, ", pipe->cons[j]);
 			add_property(dev, pipe->con_ids[j], "CRTC_ID", pipe->crtc->crtc->crtc_id);
@@ -1677,7 +1735,7 @@ static int set_mode(struct device *dev, struct pipe_arg *pipes, unsigned int cou
 
 	bo = bo_create(dev->fd, pipes[0].fourcc, dev->mode.width,
 		       dev->mode.height, handles, pitches, offsets,
-		       UTIL_PATTERN_SMPTE);
+		       primary_fill);
 	if (bo == NULL)
 		return -ENOMEM;
 
@@ -1724,6 +1782,8 @@ static int set_mode(struct device *dev, struct pipe_arg *pipes, unsigned int cou
 			fprintf(stderr, "failed to set mode: %s\n", strerror(errno));
 			return -EINVAL;
 		}
+
+		set_gamma(dev, pipe->crtc->crtc->crtc_id, pipe->fourcc);
 	}
 
 	return 0;
@@ -2047,11 +2107,8 @@ static int parse_plane(struct plane_arg *plane, const char *p)
 	}
 
 	if (*end == '@') {
-		p = end + 1;
-		if (strlen(p) != 4)
-			return -EINVAL;
-
-		strcpy(plane->format_str, p);
+		strncpy(plane->format_str, end + 1, 4);
+		plane->format_str[4] = '\0';
 	} else {
 		strcpy(plane->format_str, "XR24");
 	}
@@ -2076,6 +2133,18 @@ static int parse_property(struct property_arg *p, const char *arg)
 	return 0;
 }
 
+static void parse_fill_patterns(char *arg)
+{
+	char *fill = strtok(arg, ",");
+	if (!fill)
+		return;
+	primary_fill = util_pattern_enum(fill);
+	fill = strtok(NULL, ",");
+	if (!fill)
+		return;
+	secondary_fill = util_pattern_enum(fill);
+}
+
 static void usage(char *name)
 {
 	fprintf(stderr, "usage: %s [-acDdefMPpsCvw]\n", name);
@@ -2093,6 +2162,7 @@ static void usage(char *name)
 	fprintf(stderr, "\t-v\ttest vsynced page flipping\n");
 	fprintf(stderr, "\t-w <obj_id>:<prop_name>:<value>\tset property\n");
 	fprintf(stderr, "\t-a \tuse atomic API\n");
+	fprintf(stderr, "\t-F pattern1,pattern2\tspecify fill patterns\n");
 
 	fprintf(stderr, "\n Generic options:\n\n");
 	fprintf(stderr, "\t-d\tdrop master after mode set\n");
@@ -2156,7 +2226,7 @@ static int pipe_resolve_connectors(struct device *dev, struct pipe_arg *pipe)
 	return 0;
 }
 
-static char optstr[] = "acdD:efM:P:ps:Cvw:";
+static char optstr[] = "acdD:efF:M:P:ps:Cvw:";
 
 int main(int argc, char **argv)
 {
@@ -2206,6 +2276,9 @@ int main(int argc, char **argv)
 			break;
 		case 'f':
 			framebuffers = 1;
+			break;
+		case 'F':
+			parse_fill_patterns(optarg);
 			break;
 		case 'M':
 			module = optarg;
