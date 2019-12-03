@@ -112,7 +112,9 @@ libdrm_la_LIBADD = @CLOCK_LIB@ -lm
 libdrm_la_CPPFLAGS = -I$(top_srcdir)/include/drm
 AM_CFLAGS = \
 	$(WARN_CFLAGS) \
-	$(VALGRIND_CFLAGS)
+	$(VALGRIND_CFLAGS) \
+	-Wno-error=implicit-function-declaration \
+	-Wno-format-truncation
 
 libdrm_la_SOURCES = $(LIBDRM_FILES)
 
