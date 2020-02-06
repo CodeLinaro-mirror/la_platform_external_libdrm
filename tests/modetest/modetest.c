@@ -49,8 +49,11 @@
 #include <string.h>
 #include <strings.h>
 #include <errno.h>
-#include <sys/poll.h>
+#include <poll.h>
 #include <sys/time.h>
+#ifdef HAVE_SYS_SELECT_H
+#include <sys/select.h>
+#endif
 
 #include "xf86drm.h"
 #include "xf86drmMode.h"
@@ -231,7 +234,6 @@ static void dump_blob(struct device *dev, uint32_t blob_id)
 	uint32_t i;
 	unsigned char *blob_data;
 	drmModePropertyBlobPtr blob;
-	uint32_t printable = 0;
 
 	blob = drmModeGetPropertyBlob(dev->fd, blob_id);
 	if (!blob) {
@@ -245,19 +247,8 @@ static void dump_blob(struct device *dev, uint32_t blob_id)
 		if (i % 16 == 0)
 			printf("\n\t\t\t");
 		printf("%.2hhx", blob_data[i]);
-
-		if (isascii(blob_data[i]))
-				printable++;
 	}
 	printf("\n");
-
-	if (printable == blob->length) {
-		printf("\n-------------------------------------------------\n");
-		for (i = 0; i < blob->length; i++) {
-			printf("%c", blob_data[i]);
-		}
-		printf("\n-------------------------------------------------\n");
-	}
 
 	drmModeFreePropertyBlob(blob);
 }
@@ -807,7 +798,6 @@ struct pipe_arg {
 	unsigned int vrefresh;
 	unsigned int fourcc;
 	drmModeModeInfo *mode;
-	uint32_t mode_blob_id;
 	struct crtc *crtc;
 	unsigned int fb_id[2], current_fb_id;
 	struct timeval start;
@@ -951,64 +941,9 @@ static int pipe_find_crtc_and_mode(struct device *dev, struct pipe_arg *pipe)
 	return 0;
 }
 
-static drmModePlane *find_plane_for_crtc(struct device *dev, uint32_t crtc_id, bool primary)
-{
-	drmModePlane *ovr;
-	unsigned int count_crtcs = dev->resources->res->count_crtcs;
-	unsigned int pipe;
-	unsigned int i;
-
-	/* Find a plane which can be connected to our CRTC. Find the
-	 * CRTC index first, then iterate over available planes.
-	 */
-	for (i = 0; i < count_crtcs; i++) {
-		if (crtc_id == dev->resources->res->crtcs[i]) {
-			pipe = i;
-			break;
-		}
-	}
-
-	if (i == count_crtcs) {
-		fprintf(stderr, "CRTC %u not found\n", crtc_id);
-		return NULL;
-	}
-
-	for (i = 0; i < dev->resources->plane_res->count_planes; i++) {
-		ovr = dev->resources->planes[i].plane;
-		if (!ovr)
-			continue;
-
-		if ((primary && (ovr->possible_crtcs == (1U << pipe)) && (crtc_id == ovr->crtc_id)) ||
-		    (!primary && (ovr->possible_crtcs & (1U << pipe)) && !ovr->crtc_id))
-			return ovr;
-	}
-
-	return NULL;
-}
-
 /* -----------------------------------------------------------------------------
  * Properties
  */
-#define find_prop_id(_res, __res, type, obj_id, prop_name, prop_id)			\
-	do {										\
-		int i, j = 0;								\
-		int obj_count = (int)(_res)->__res->count_##type##s;			\
-		int prop_count = 0;							\
-		struct type *obj = NULL;						\
-		for (i = 0; i < obj_count; ++i) {					\
-			obj = &(_res)->type##s[i];					\
-			if (obj->type->type##_id != (obj_id))				\
-				continue;						\
-			prop_count = (int)obj->props->count_props;			\
-			for (j = 0; j < prop_count; ++j) {				\
-				if (!strcmp(obj->props_info[j]->name, (prop_name)))	\
-					break;						\
-			}								\
-			break;								\
-		}									\
-		(prop_id) = ((i == obj_count) || (j == prop_count) || (obj == NULL)) ?	\
-					0 : obj->props_info[j]->prop_id;		\
-	} while (0)
 
 struct property_arg {
 	uint32_t obj_id;
@@ -1019,8 +954,7 @@ struct property_arg {
 	bool optional;
 };
 
-static bool set_property(struct device *dev, struct property_arg *p,
-			drmModeAtomicReq *atomic_req)
+static bool set_property(struct device *dev, struct property_arg *p)
 {
 	drmModeObjectProperties *props = NULL;
 	drmModePropertyRes **props_info = NULL;
@@ -1077,12 +1011,11 @@ static bool set_property(struct device *dev, struct property_arg *p,
 
 	p->prop_id = props->props[i];
 
-	if (atomic_req)
-		ret = drmModeAtomicAddProperty(atomic_req, p->obj_id,
-						p->prop_id, p->value);
-	else
+	if (!dev->use_atomic)
 		ret = drmModeObjectSetProperty(dev->fd, p->obj_id, p->obj_type,
-				       p->prop_id, p->value);
+									   p->prop_id, p->value);
+	else
+		ret = drmModeAtomicAddProperty(dev->req, p->obj_id, p->prop_id, p->value);
 
 	if (ret < 0)
 		fprintf(stderr, "failed to set %s %i property %s to %" PRIu64 ": %s\n",
@@ -1092,251 +1025,6 @@ static bool set_property(struct device *dev, struct property_arg *p,
 }
 
 /* -------------------------------------------------------------------------- */
-
-/* -----------------------------------------------------------------------------
- * Atomic
- */
-
-#define ATOMIC_PAGEFLIP_PIPE_MAX	4
-
-struct atomic_pageflip_event_data {
-	struct device *dev;
-	int pipe_count;
-	struct pipe_arg *pipes[ATOMIC_PAGEFLIP_PIPE_MAX];
-};
-
-static int atomic_req_commit_and_free(struct device *dev, drmModeAtomicReq *req,
-				uint32_t flags, void *user_data)
-{
-	int ret;
-
-	ret = drmModeAtomicCommit(dev->fd, req, flags, user_data);
-	if (ret)
-		fprintf(stderr, "Atomic commit failed, %s\n", strerror(errno));
-	drmModeAtomicFree(req);
-
-	return ret;
-}
-
-#define ATOMIC_ADD_PROP_FUNC_DEF(type, _res)	\
-static int atomic_add_prop_to_##type(struct device *dev, drmModeAtomicReq *req,	\
-			uint32_t obj_id, const char *prop_name, uint64_t value)	\
-{										\
-	uint32_t prop_id;							\
-										\
-	find_prop_id(dev->resources, _res, type, obj_id, prop_name, prop_id);	\
-	if (prop_id == 0) {							\
-		fprintf(stderr, "%s: failed to find %s prop for obj %u\n",	\
-			__func__, prop_name, obj_id);				\
-		return -EINVAL;							\
-	}									\
-	if (drmModeAtomicAddProperty(req, obj_id, prop_id, value) < 0) {	\
-		fprintf(stderr, "%s: failed to Add %s prop to obj %u, %s\n",	\
-			__func__, prop_name, obj_id, strerror(errno));		\
-		return -EINVAL;							\
-	}									\
-										\
-	return 0;								\
-}
-
-ATOMIC_ADD_PROP_FUNC_DEF(crtc, res);
-ATOMIC_ADD_PROP_FUNC_DEF(connector, res);
-ATOMIC_ADD_PROP_FUNC_DEF(plane, plane_res);
-
-static int atomic_populate_plane(struct device *dev, drmModeAtomicReq *req,
-	uint32_t plane_id, uint32_t fb_id, uint32_t crtc_id,
-	uint32_t src_x, uint32_t src_y, uint32_t src_w, uint32_t src_h,
-	uint32_t crtc_x, uint32_t crtc_y, uint32_t crtc_w, uint32_t crtc_h)
-{
-	int ret = -EINVAL;
-
-	if (atomic_add_prop_to_plane(dev, req, plane_id, "FB_ID", fb_id))
-		goto end;
-
-	if (atomic_add_prop_to_plane(dev, req, plane_id, "SRC_X", src_x << 16))
-		goto end;
-
-	if (atomic_add_prop_to_plane(dev, req, plane_id, "SRC_Y", src_y << 16))
-		goto end;
-
-	if (atomic_add_prop_to_plane(dev, req, plane_id, "SRC_W", src_w << 16))
-		goto end;
-
-	if (atomic_add_prop_to_plane(dev, req, plane_id, "SRC_H", src_h << 16))
-		goto end;
-
-	if (atomic_add_prop_to_plane(dev, req, plane_id, "CRTC_X", crtc_x))
-		goto end;
-
-	if (atomic_add_prop_to_plane(dev, req, plane_id, "CRTC_Y", crtc_y))
-		goto end;
-
-	if (atomic_add_prop_to_plane(dev, req, plane_id, "CRTC_W", crtc_w))
-		goto end;
-
-	if (atomic_add_prop_to_plane(dev, req, plane_id, "CRTC_H", crtc_h))
-		goto end;
-
-	if (atomic_add_prop_to_plane(dev, req, plane_id, "CRTC_ID", crtc_id))
-		goto end;
-
-	ret = 0;
-end:
-	return ret;
-}
-
-int atomic_populate_pipe_modeset(struct device *dev, drmModeAtomicReq *req,
-	struct pipe_arg *pipe, uint32_t fb_id,
-	uint32_t src_x, uint32_t src_y, uint32_t src_w, uint32_t src_h,
-	uint32_t crtc_x, uint32_t crtc_y, uint32_t crtc_w, uint32_t crtc_h)
-{
-	drmModeModeInfoPtr mode = pipe->mode;
-	drmModePlanePtr ovr = NULL;
-	uint32_t crtc_id = pipe->crtc->crtc->crtc_id;
-	uint32_t *conn_ids = pipe->con_ids;
-	unsigned int conn_count = pipe->num_cons, i;
-	int ret;
-
-	ret = drmModeCreatePropertyBlob(dev->fd, mode, sizeof(*mode), &pipe->mode_blob_id);
-	if (ret) {
-		fprintf(stderr, "failed to create mode(%s) blob, %s\n", mode->name, strerror(errno));
-		pipe->mode_blob_id = 0;
-		return -EINVAL;
-	}
-
-	for (i = 0; i < conn_count; i++)
-		if (atomic_add_prop_to_connector(dev, req, conn_ids[i], "CRTC_ID", crtc_id))
-			return -EINVAL;
-
-	if (atomic_add_prop_to_crtc(dev, req, crtc_id, "MODE_ID", pipe->mode_blob_id))
-		return -EINVAL;
-
-	if (atomic_add_prop_to_crtc(dev, req, crtc_id, "ACTIVE", 1))
-		return -EINVAL;
-
-	ovr = find_plane_for_crtc(dev, crtc_id, true);
-
-	/* If no primary plane, try to get any available plane on this crtc */
-	if (!ovr)
-		ovr = find_plane_for_crtc(dev, crtc_id, false);
-
-	if (!ovr) {
-		fprintf(stderr, "failed to find plane for crtc %u\n", crtc_id);
-		return -EINVAL;
-	}
-
-	if (atomic_populate_plane(dev, req, ovr->plane_id, fb_id, crtc_id,
-				src_x, src_y, src_w, src_h,
-				crtc_x, crtc_y, crtc_w, crtc_h)) {
-		fprintf(stderr, "failed to populate plane prop for crtc %u modeset\n", crtc_id);
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-static int atomic_populate_plane_pageflip(struct device *dev, drmModeAtomicReq *req,
-	uint32_t plane_id, uint32_t fb_id)
-{
-	if (atomic_add_prop_to_plane(dev, req, plane_id, "FB_ID", fb_id))
-		return -EINVAL;
-
-	return 0;
-}
-
-static int atomic_populate_pipe_pageflip(struct device *dev, drmModeAtomicReq *req,
-	struct pipe_arg *pipe, uint32_t fb_id)
-{
-	/* FIXME: Here we assume each crtc has a primary plane,
-	 * and we only do pageflip on that plane.
-	 * Ideally, we should be able to pageflip on any plane
-	 * parsed from cmdline.
-	 */
-	drmModePlane *ovr = find_plane_for_crtc(dev,
-			pipe->crtc->crtc->crtc_id, true);
-	if (!ovr) {
-		fprintf(stderr, "failed to find primary plane for crtc %d",
-			pipe->crtc->crtc->crtc_id);
-		return -EINVAL;
-	}
-
-	return atomic_populate_plane_pageflip(dev, req, ovr->plane_id, fb_id);
-}
-
-static void
-atomic_page_flip_handler(int fd, unsigned int frame,
-		  unsigned int sec, unsigned int usec, void *data)
-{
-	struct atomic_pageflip_event_data *e = data;
-	struct device *dev = e->dev;
-	struct pipe_arg **pipes = e->pipes;
-	struct pipe_arg *pipe;
-	drmModeAtomicReqPtr req = NULL;
-	struct timeval end;
-	int pipe_count = e->pipe_count;
-	unsigned int new_fb_id;
-	int i, ret;
-	static int pipe_event_count = 0;
-
-	/* Currently, user has no idea from which pipe the event is returned.
-	 * Just count the number of events until it reaches the expected count
-	 * before trigger the next pageflip.
-	 * For long term, we should have crtc id in the driver returned event.
-	 */
-	if (++pipe_event_count < pipe_count)
-		return;
-
-	pipe_event_count = 0;
-
-	req = drmModeAtomicAlloc();
-	if (!req) {
-		fprintf(stderr, "Atomic allocate failed!\n");
-		return;
-	}
-
-	for (i = 0; i < pipe_count; i++) {
-		pipe = pipes[i];
-		if (pipe->current_fb_id == pipe->fb_id[0])
-			new_fb_id = pipe->fb_id[1];
-		else
-			new_fb_id = pipe->fb_id[0];
-
-		if (atomic_populate_pipe_pageflip(dev, req, pipe, new_fb_id)) {
-			fprintf(stderr, "populate pipe pageflip failed! crtc = %u\n",
-				pipe->crtc->crtc->crtc_id);
-			goto fail;
-		}
-	}
-
-	if (atomic_req_commit_and_free(dev, req,
-		DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK, e))
-		return;
-
-	gettimeofday(&end, NULL);
-
-	for (i = 0; i < pipe_count; i++) {
-		pipe = pipes[i];
-		pipe->current_fb_id = new_fb_id;
-		pipe->swap_count++;
-		if (pipe->swap_count == 60) {
-			/* Only print fps once on the first pipe */
-			if (i == 0) {
-				double t;
-				t = end.tv_sec + end.tv_usec * 1e-6 -
-					(pipe->start.tv_sec + pipe->start.tv_usec * 1e-6);
-				fprintf(stderr, "freq: %.02fHz\n", pipe->swap_count / t);
-			}
-			pipe->swap_count = 0;
-			pipe->start = end;
-		}
-	}
-
-	return;
-
-fail:
-	drmModeAtomicFree(req);
-	return;
-}
 
 static void
 page_flip_handler(int fd, unsigned int frame,
@@ -1367,6 +1055,18 @@ page_flip_handler(int fd, unsigned int frame,
 	}
 }
 
+static bool format_support(const drmModePlanePtr ovr, uint32_t fmt)
+{
+	unsigned int i;
+
+	for (i = 0; i < ovr->count_formats; ++i) {
+		if (ovr->formats[i] == fmt)
+			return true;
+	}
+
+	return false;
+}
+
 static void add_property(struct device *dev, uint32_t obj_id,
 			       const char *name, uint64_t value)
 {
@@ -1376,7 +1076,7 @@ static void add_property(struct device *dev, uint32_t obj_id,
 	strcpy(p.name, name);
 	p.value = value;
 
-	set_property(dev, &p, NULL);
+	set_property(dev, &p);
 }
 
 static bool add_property_optional(struct device *dev, uint32_t obj_id,
@@ -1389,7 +1089,7 @@ static bool add_property_optional(struct device *dev, uint32_t obj_id,
 	p.value = value;
 	p.optional = true;
 
-	return set_property(dev, &p, NULL);
+	return set_property(dev, &p);
 }
 
 static void set_gamma(struct device *dev, unsigned crtc_id, unsigned fourcc)
@@ -1504,34 +1204,59 @@ static int atomic_set_plane(struct device *dev, struct plane_arg *p,
 	return 0;
 }
 
-static int set_plane(struct device *dev, struct plane_arg *p,
-			drmModeAtomicReq *atomic_req)
+static int set_plane(struct device *dev, struct plane_arg *p)
 {
 	drmModePlane *ovr;
 	uint32_t handles[4] = {0}, pitches[4] = {0}, offsets[4] = {0};
-	uint32_t plane_id = 0;
+	uint32_t plane_id;
 	struct bo *plane_bo;
 	uint32_t plane_flags = 0;
 	int crtc_x, crtc_y, crtc_w, crtc_h;
 	struct crtc *crtc = NULL;
-	int crtc_index = get_crtc_index(dev, p->crtc_id);
-	int ret;
+	unsigned int pipe;
+	unsigned int i;
 
-	if (crtc_index < 0) {
-		fprintf(stderr, "failed to find CRTC id %u\n", p->crtc_id);
+	/* Find an unused plane which can be connected to our CRTC. Find the
+	 * CRTC index first, then iterate over available planes.
+	 */
+	for (i = 0; i < (unsigned int)dev->resources->res->count_crtcs; i++) {
+		if (p->crtc_id == dev->resources->res->crtcs[i]) {
+			crtc = &dev->resources->crtcs[i];
+			pipe = i;
+			break;
+		}
+	}
+
+	if (!crtc) {
+		fprintf(stderr, "CRTC %u not found\n", p->crtc_id);
 		return -1;
 	}
 
-	crtc = &dev->resources->crtcs[crtc_index];
+	plane_id = p->plane_id;
 
-	ovr = find_plane_for_crtc(dev, p->crtc_id, false);
-	if (!ovr) {
+	for (i = 0; i < dev->resources->plane_res->count_planes; i++) {
+		ovr = dev->resources->planes[i].plane;
+		if (!ovr)
+			continue;
+
+		if (plane_id && plane_id != ovr->plane_id)
+			continue;
+
+		if (!format_support(ovr, p->fourcc))
+			continue;
+
+		if ((ovr->possible_crtcs & (1 << pipe)) &&
+		    (ovr->crtc_id == 0 || ovr->crtc_id == p->crtc_id)) {
+			plane_id = ovr->plane_id;
+			break;
+		}
+	}
+
+	if (i == dev->resources->plane_res->count_planes) {
 		fprintf(stderr, "no unused plane available for CRTC %u\n",
-			p->crtc_id);
+			crtc->crtc->crtc_id);
 		return -1;
 	}
-
-	plane_id = ovr->plane_id;
 
 	fprintf(stderr, "testing %dx%d@%s overlay plane %u\n",
 		p->w, p->h, p->format_str, plane_id);
@@ -1561,18 +1286,12 @@ static int set_plane(struct device *dev, struct plane_arg *p,
 		crtc_y = p->y;
 	}
 
-	if (atomic_req)
-		ret = atomic_populate_plane(dev, atomic_req, plane_id,
-				p->fb_id, p->crtc_id,
-				0, 0, p->w, p->h, crtc_x, crtc_y, crtc_w, crtc_h);
-	else
-		/* note src coords (last 4 args) are in Q16 format */
-		ret = drmModeSetPlane(dev->fd, plane_id, p->crtc_id, p->fb_id,
+	/* note src coords (last 4 args) are in Q16 format */
+	if (drmModeSetPlane(dev->fd, plane_id, crtc->crtc->crtc_id, p->fb_id,
 			    plane_flags, crtc_x, crtc_y, crtc_w, crtc_h,
-			    0, 0, p->w << 16, p->h << 16);
-
-	if (ret){
-		fprintf(stderr, "failed to enable plane: %s\n", strerror(errno));
+			    0, 0, p->w << 16, p->h << 16)) {
+		fprintf(stderr, "failed to enable plane: %s\n",
+			strerror(errno));
 		return -1;
 	}
 
@@ -1707,8 +1426,7 @@ static void atomic_clear_mode(struct device *dev, struct pipe_arg *pipes, unsign
 	}
 }
 
-static int set_mode(struct device *dev, struct pipe_arg *pipes, unsigned int count,
-			drmModeAtomicReq *atomic_req)
+static void set_mode(struct device *dev, struct pipe_arg *pipes, unsigned int count)
 {
 	uint32_t handles[4] = {0}, pitches[4] = {0}, offsets[4] = {0};
 	unsigned int fb_id;
@@ -1737,7 +1455,7 @@ static int set_mode(struct device *dev, struct pipe_arg *pipes, unsigned int cou
 		       dev->mode.height, handles, pitches, offsets,
 		       primary_fill);
 	if (bo == NULL)
-		return -ENOMEM;
+		return;
 
 	dev->mode.bo = bo;
 
@@ -1746,7 +1464,7 @@ static int set_mode(struct device *dev, struct pipe_arg *pipes, unsigned int cou
 	if (ret) {
 		fprintf(stderr, "failed to add fb (%ux%u): %s\n",
 			dev->mode.width, dev->mode.height, strerror(errno));
-		return -EINVAL;
+		return;
 	}
 
 	dev->mode.fb_id = fb_id;
@@ -1764,14 +1482,9 @@ static int set_mode(struct device *dev, struct pipe_arg *pipes, unsigned int cou
 			printf("%s, ", pipe->cons[j]);
 		printf("crtc %d\n", pipe->crtc->crtc->crtc_id);
 
-		if (atomic_req)
-			ret = atomic_populate_pipe_modeset(dev, atomic_req, pipe, fb_id,
-				x, 0, pipe->mode->hdisplay, pipe->mode->vdisplay,
-				0, 0, pipe->mode->hdisplay, pipe->mode->vdisplay);
-		else
-			ret = drmModeSetCrtc(dev->fd, pipe->crtc->crtc->crtc_id, fb_id,
-				x, 0, pipe->con_ids, pipe->num_cons,
-				pipe->mode);
+		ret = drmModeSetCrtc(dev->fd, pipe->crtc->crtc->crtc_id, fb_id,
+				     x, 0, pipe->con_ids, pipe->num_cons,
+				     pipe->mode);
 
 		/* XXX: Actually check if this is needed */
 		drmModeDirtyFB(dev->fd, fb_id, NULL, 0);
@@ -1780,13 +1493,11 @@ static int set_mode(struct device *dev, struct pipe_arg *pipes, unsigned int cou
 
 		if (ret) {
 			fprintf(stderr, "failed to set mode: %s\n", strerror(errno));
-			return -EINVAL;
+			return;
 		}
 
 		set_gamma(dev, pipe->crtc->crtc->crtc_id, pipe->fourcc);
 	}
-
-	return 0;
 }
 
 static void clear_mode(struct device *dev)
@@ -1797,32 +1508,22 @@ static void clear_mode(struct device *dev)
 		bo_destroy(dev->mode.bo);
 }
 
-static int set_planes(struct device *dev, struct plane_arg *p, unsigned int count,
-			drmModeAtomicReq *atomic_req)
+static void set_planes(struct device *dev, struct plane_arg *p, unsigned int count)
 {
 	unsigned int i;
 
 	/* set up planes/overlays */
 	for (i = 0; i < count; i++)
-		if (set_plane(dev, &p[i], atomic_req))
-			return -1;
-
-	return 0;
+		if (set_plane(dev, &p[i]))
+			return;
 }
 
-static int set_cursors(struct device *dev, struct pipe_arg *pipes, unsigned int count,
-			drmModeAtomicReq *atomic_req)
+static void set_cursors(struct device *dev, struct pipe_arg *pipes, unsigned int count)
 {
 	uint32_t handles[4] = {0}, pitches[4] = {0}, offsets[4] = {0};
 	struct bo *bo;
 	unsigned int i;
 	int ret;
-
-	/* TODO: Support atomic cursor */
-	if (atomic_req) {
-		fprintf(stderr, "not support atomic cursor yet\n");
-		return -EINVAL;
-	}
 
 	/* maybe make cursor width/height configurable some day */
 	uint32_t cw = 64;
@@ -1834,7 +1535,7 @@ static int set_cursors(struct device *dev, struct pipe_arg *pipes, unsigned int 
 	bo = bo_create(dev->fd, DRM_FORMAT_ARGB8888, cw, ch, handles, pitches,
 		       offsets, UTIL_PATTERN_PLAIN);
 	if (bo == NULL)
-		return -ENOMEM;
+		return;
 
 	dev->mode.cursor_bo = bo;
 
@@ -1847,13 +1548,11 @@ static int set_cursors(struct device *dev, struct pipe_arg *pipes, unsigned int 
 		if (ret) {
 			fprintf(stderr, "failed to init cursor for CRTC[%u]\n",
 					pipe->crtc_id);
-			return -EINVAL;
+			return;
 		}
 	}
 
 	cursor_start();
-
-	return 0;
 }
 
 static void clear_cursors(struct device *dev)
@@ -1864,15 +1563,12 @@ static void clear_cursors(struct device *dev)
 		bo_destroy(dev->mode.cursor_bo);
 }
 
-static void test_page_flip(struct device *dev, struct pipe_arg *pipes,
-			unsigned int count, bool atomic)
+static void test_page_flip(struct device *dev, struct pipe_arg *pipes, unsigned int count)
 {
 	uint32_t handles[4] = {0}, pitches[4] = {0}, offsets[4] = {0};
 	unsigned int other_fb_id;
 	struct bo *other_bo;
 	drmEventContext evctx;
-	drmModeAtomicReqPtr atomic_req = NULL;
-	struct atomic_pageflip_event_data atomic_user_data;
 	unsigned int i;
 	int ret;
 
@@ -1890,37 +1586,15 @@ static void test_page_flip(struct device *dev, struct pipe_arg *pipes,
 		goto err;
 	}
 
-	if (atomic) {
-		if (count > ATOMIC_PAGEFLIP_PIPE_MAX)
-			goto err_rmfb;
-
-		atomic_req = drmModeAtomicAlloc();
-		if (!atomic_req) {
-			fprintf(stderr, "Atomic allocate failed!\n");
-			goto err_rmfb;
-		}
-
-		atomic_user_data.dev = dev;
-		atomic_user_data.pipe_count = count;
-	}
-
 	for (i = 0; i < count; i++) {
 		struct pipe_arg *pipe = &pipes[i];
 
 		if (pipe->mode == NULL)
 			continue;
 
-		if (atomic_req) {
-			atomic_user_data.pipes[i] = pipe;
-			ret = atomic_populate_pipe_pageflip(dev, atomic_req,
-					pipe, other_fb_id);
-			if (ret)
-				drmModeAtomicFree(atomic_req);
-		} else {
-			ret = drmModePageFlip(dev->fd, pipe->crtc->crtc->crtc_id,
+		ret = drmModePageFlip(dev->fd, pipe->crtc->crtc->crtc_id,
 				      other_fb_id, DRM_MODE_PAGE_FLIP_EVENT,
 				      pipe);
-		}
 		if (ret) {
 			fprintf(stderr, "failed to page flip: %s\n", strerror(errno));
 			goto err_rmfb;
@@ -1935,17 +1609,7 @@ static void test_page_flip(struct device *dev, struct pipe_arg *pipes,
 	memset(&evctx, 0, sizeof evctx);
 	evctx.version = DRM_EVENT_CONTEXT_VERSION;
 	evctx.vblank_handler = NULL;
-
-	if (atomic_req) {
-		if (atomic_req_commit_and_free(dev, atomic_req,
-			DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK,
-			&atomic_user_data))
-			goto err_rmfb;
-
-		evctx.page_flip_handler = atomic_page_flip_handler;
-	} else {
-		evctx.page_flip_handler = page_flip_handler;
-	}
+	evctx.page_flip_handler = page_flip_handler;
 
 	while (1) {
 #if 0
@@ -2246,10 +1910,8 @@ int main(int argc, char **argv)
 	struct pipe_arg *pipe_args = NULL;
 	struct plane_arg *plane_args = NULL;
 	struct property_arg *prop_args = NULL;
-	drmModeAtomicReqPtr atomic_req = NULL;
-	int test_atomic = 0;
 	unsigned int args = 0;
-	int ret = 0;
+	int ret;
 
 	memset(&dev, 0, sizeof dev);
 
@@ -2259,7 +1921,7 @@ int main(int argc, char **argv)
 
 		switch (c) {
 		case 'a':
-			test_atomic = 1;
+			use_atomic = 1;
 			break;
 		case 'c':
 			connectors = 1;
@@ -2350,13 +2012,14 @@ int main(int argc, char **argv)
 	if (dev.fd < 0)
 		return -1;
 
-	if (test_atomic && drmSetClientCap(dev.fd, DRM_CLIENT_CAP_ATOMIC, 1)) {
-		fprintf(stderr, "atomic not supported by drm.\n");
+	ret = drmSetClientCap(dev.fd, DRM_CLIENT_CAP_ATOMIC, 1);
+	if (ret && use_atomic) {
+		fprintf(stderr, "no atomic modesetting support: %s\n", strerror(errno));
 		drmClose(dev.fd);
 		return -1;
 	}
 
-	dev.use_atomic = test_atomic;
+	dev.use_atomic = use_atomic;
 
 	if (test_vsync && !page_flipping_supported()) {
 		fprintf(stderr, "page flipping not supported by drm.\n");
@@ -2395,16 +2058,8 @@ int main(int argc, char **argv)
 	dump_resource(&dev, planes);
 	dump_resource(&dev, framebuffers);
 
-	if (test_atomic) {
-		atomic_req = drmModeAtomicAlloc();
-		if (!atomic_req) {
-			fprintf(stderr, "Atomic allocate failed!\n");
-			goto free_res;
-		}
-	}
-
 	for (i = 0; i < prop_count; ++i)
-		ret |= set_property(&dev, &prop_args[i], atomic_req);
+		set_property(&dev, &prop_args[i]);
 
 	if (dev.use_atomic) {
 		dev.req = drmModeAtomicAlloc();
@@ -2476,34 +2131,26 @@ int main(int argc, char **argv)
 
 		drmModeAtomicFree(dev.req);
 	} else {
-	if ((count || plane_count) && !ret) {
-		uint64_t cap = 0;
+		if (count || plane_count) {
+			uint64_t cap = 0;
 
-		ret = drmGetCap(dev.fd, DRM_CAP_DUMB_BUFFER, &cap);
-		if (ret || cap == 0) {
-			fprintf(stderr, "driver doesn't support the dumb buffer API\n");
-			goto free_atomic;
-		}
+			ret = drmGetCap(dev.fd, DRM_CAP_DUMB_BUFFER, &cap);
+			if (ret || cap == 0) {
+				fprintf(stderr, "driver doesn't support the dumb buffer API\n");
+				return 1;
+			}
 
-		if (count)
-			ret |= set_mode(&dev, pipe_args, count, atomic_req);
+			if (count)
+				set_mode(&dev, pipe_args, count);
 
-		if (plane_count)
-			ret |= set_planes(&dev, plane_args, plane_count, atomic_req);
+			if (plane_count)
+				set_planes(&dev, plane_args, plane_count);
 
-		if (test_cursor)
-			ret |= set_cursors(&dev, pipe_args, count, atomic_req);
-
-		if (atomic_req && !ret)
-			ret = drmModeAtomicCommit(dev.fd, atomic_req,
-				count ? DRM_MODE_ATOMIC_ALLOW_MODESET : 0,
-				NULL);
-
-		if (test_vsync && !ret)
-			test_page_flip(&dev, pipe_args, count, test_atomic);
+			if (test_cursor)
+				set_cursors(&dev, pipe_args, count);
 
 			if (test_vsync)
-				test_page_flip(&dev, pipe_args, count, atomic_req);
+				test_page_flip(&dev, pipe_args, count);
 
 			if (drop_master)
 				drmDropMaster(dev.fd);
@@ -2521,15 +2168,6 @@ int main(int argc, char **argv)
 		}
 	}
 
-free_atomic:
-	if (atomic_req) {
-		for (i = 0; i < (unsigned int)count; i++)
-			if (pipe_args[i].mode_blob_id != 0)
-				drmModeDestroyPropertyBlob(dev.fd,
-					pipe_args[i].mode_blob_id);
-		drmModeAtomicFree(atomic_req);
-	}
-free_res:
 	free_resources(dev.resources);
 
 	return 0;
