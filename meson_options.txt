@@ -141,3 +141,9 @@ option(
   value : false,
   description : 'Enable support for using udev instead of mknod.',
 )
+option(
+  'enable_drm-fe',
+  type: 'string',
+  value: '',
+  description : 'Have DRM front-end support',
+)
